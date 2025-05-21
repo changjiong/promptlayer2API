@@ -277,7 +277,7 @@ async function postmessage(authHeader, workspaceId, playground_sessions, databod
     }
     const response = await axios.post(url, data, { headers });
     if (response.data.success) {
-        return response.data.run_group.individual_run_requests[0].id
+        return 1
     } else {
         return -1
     }
@@ -358,27 +358,56 @@ app.get('/v1/models', async (req, res) => {
 
 
 app.post('/v1/chat/completions', async (req, res) => {
-    let databody = req.body
-    databody.messages = normalizeMessages(databody.messages)
-    let access = ""
-    let authHeader = req.headers['authorization'];
-    if (authHeader && authHeader.startsWith("Bearer")) {
-        access = authHeader.split("Bearer ")[1];
+    let databody = req.body;
+    databody.messages = normalizeMessages(databody.messages);
+
+    // 从环境变量中获取 PromptLayer 凭证
+    const promptlayerEmail = Deno.env.get("PROMPTLAYER_EMAIL");
+    const promptlayerPassword = Deno.env.get("PROMPTLAYER_PASSWORD");
+
+    if (!promptlayerEmail || !promptlayerPassword) {
+        console.error("错误：PROMPTLAYER_EMAIL 或 PROMPTLAYER_PASSWORD 环境变量未设置。");
+        return res.status(500).json({
+            success: false,
+            message: "服务器配置错误：PromptLayer 凭证未设置。"
+        });
     }
-    if(access == "") {
-        return
+
+    let access_token_from_login;
+    try {
+        const loginResult = await login(promptlayerEmail, promptlayerPassword);
+        if (loginResult === -1 || !loginResult.access_token) {
+            console.error("PromptLayer 登录失败。");
+            return res.status(401).json({
+                success: false,
+                message: "PromptLayer 认证失败，请检查服务器配置的凭证。"
+            });
+        }
+        access_token_from_login = loginResult.access_token;
+    } catch (error) {
+        console.error("PromptLayer 登录时发生错误:", error);
+        return res.status(500).json({
+            success: false,
+            message: "PromptLayer 登录时发生内部错误。"
+        });
     }
-    access = (await login(access.split("-")[0], access.split("-")[1])).access_token
     const [tokenResult, workspaceResult] = await Promise.all([
-        fetchTokenDetails(access),
-        fetchWorkspaceId(access)
-    ]);
+        fetchTokenDetails(access_token_from_login),
+        fetchWorkspaceId(access_token_from_login)
+    ]).catch(error => {
+        console.error("获取 PromptLayer token 或 workspace ID 时出错:", error);
+        res.status(500).json({ success: false, message: "获取 PromptLayer 详细信息失败。" });
+        return [null, null]; // 返回 null 以便后续检查可以中止
+    });
+
+    if (!tokenResult || !workspaceResult) return; // 如果出错则中止
 
     const { access_token, clientId } = tokenResult;
     const { workspaceId } = workspaceResult;
 
     //刷新sessionid
-    let playground_sessions = await pysession(access, workspaceId, databody)
+    let playground_sessions = await pysession(access_token_from_login, workspaceId, databody); // 使用登录获取的 token
+
 
     // 发送的数据
     const sendAction = `{"action":10,"channel":"user:${clientId}","params":{"agent":"react-hooks/2.0.2"}}`
@@ -392,17 +421,14 @@ app.post('/v1/chat/completions', async (req, res) => {
     let linshi = ""
     let send = ""
     let nonstr = ""
-    let requestId = ""
-    ws.onopen = async () => {
+    postmessage(access, workspaceId, playground_sessions, databody)
+    ws.onopen = () => {
         ws.send(sendAction);
-       requestId = await postmessage(access, workspaceId, playground_sessions, databody)
-    //    console.log("individual_run_request_id:" + requestId)
     };
 
     ws.onmessage = async (event) => {
         try {
             const data = event.data;
-            // console.log(data)
             linshi = ""
             send = ""
             const msg = JSON.parse(data);
@@ -412,7 +438,6 @@ app.post('/v1/chat/completions', async (req, res) => {
                     typeof firstMsg.data === "string" &&
                     isJsonString(firstMsg.data)
                 ) {
-                if(JSON.parse(msg.messages[0].data).individual_run_request_id == requestId)  {
                 linshi = JSON.parse(msg.messages[0].data).payload.message.content[0].text
                 send = findDifference(last, linshi)
                 last = linshi
@@ -420,8 +445,6 @@ app.post('/v1/chat/completions', async (req, res) => {
                 if (databody.stream == true) {
                     res.write(`data: {"id":"chatcmpl-9709rQdvMSIASrvcWGVsJMQouP2UV","object":"chat.completion.chunk","created":${Math.floor(Date.now() / 1000)},"model":"${databody.model}","system_fingerprint":"fp_3bc1b5746c","choices":[{"index":0,"delta":{"content":${JSON.stringify(send)}},"logprobs":null,"finish_reason":null}]} \n\n`)
                 }
-                }
-                
             }
              
         if (
@@ -429,8 +452,7 @@ app.post('/v1/chat/completions', async (req, res) => {
             typeof firstMsg.data === "string" &&
             isJsonString(firstMsg.data)
             ){
-                if(JSON.parse(msg.messages[0].data).individual_run_request_id == requestId)  {
-                                    if (!databody.stream || databody.stream != true) {
+                if (!databody.stream || databody.stream != true) {
                     res.json({
                         id: "chatcmpl-8Tos2WZQfPdBaccpgMkasGxtQfJtq",
                         object: "chat.completion",
@@ -463,10 +485,10 @@ app.post('/v1/chat/completions', async (req, res) => {
                 res.write(`data: [DONE]\n`);
                 res.end(); 
                 ws.close();
-                }
             }
+            // 收到 {"action":0} 时断开
             if (msg.action === 0) {
-                closedByServer = true; 
+                closedByServer = true;
                 ws.close();
             }
             // 你可以在这里做一些转发或处理，也可以直接返回到前端
@@ -476,8 +498,16 @@ app.post('/v1/chat/completions', async (req, res) => {
     }
 
     ws.onclose = () => {
-        return
-    }
+        // 如果不是由服务器主动关闭 (例如 INDIVIDUAL_RUN_COMPLETE 或 action:0)，
+        // 并且响应还没有结束，则可能需要确保客户端不会挂起。
+        if (!res.writableEnded) {
+            console.log("WebSocket closed unexpectedly.");
+            // 可以选择发送一个错误或简单结束响应
+            // res.status(500).json({ code: 4, msg: 'Socket closed unexpectedly' });
+            res.end(); // 确保响应结束
+        }
+        return;
+    };
 
     ws.onerror = (err) => {
         res.status(500).json({ code: 2, msg: 'Socket error', error: err.message });
@@ -487,9 +517,18 @@ app.post('/v1/chat/completions', async (req, res) => {
     setTimeout(() => {
         if (ws.readyState === WebSocket.OPEN) {
             ws.close();
-            res.json({ code: 3, msg: 'Socket timeout' });
         }
-    }, 240000);
+        if (!res.writableEnded) {
+            // 确保在超时时，如果响应头已发送（例如流式传输），则正确结束流
+            if (databody.stream && res.headersSent) {
+                 res.write(`data: {"error": "timeout"}\n\n`); // 可以发送一个错误事件
+                 res.write(`data: [DONE]\n`);
+            } else if (!res.headersSent) {
+                res.status(503).json({ code: 3, msg: 'Socket timeout' });
+            }
+            res.end();
+        }
+    }, 30000); // 30秒超时
 });
 
 app.listen(3000, () => {
