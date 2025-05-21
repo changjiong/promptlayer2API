@@ -23,4 +23,4 @@ EXPOSE 3000
 # --allow-env 如果你的应用将来需要读取环境变量，可以加上 (当前代码主要从请求头获取凭证)
 # 注意：确保 server.js 中的监听端口与 EXPOSE 指令以及 Dokploy 中的配置一致
 # 明确授予访问特定环境变量的权限
-CMD ["run", "--allow-net", "--allow-read=.", "--allow-env=PROMPTLAYER_EMAIL,PROMPTLAYER_PASSWORD", "server.js"]
+CMD ["run", "--allow-net", "--allow-read=.", "--allow-env", "server.js"]
